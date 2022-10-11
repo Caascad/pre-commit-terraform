@@ -11,6 +11,12 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 function main {
   common::initialize "$SCRIPT_DIR"
   common::parse_cmdline "$@"
+
+  # Support for setting PATH to repo root. for ENV_VARS
+  for i in "${!ENV_VARS[@]}"; do
+    ENV_VARS[i]="${ENV_VARS[i]/__GIT_WORKING_DIR__/$(pwd)\/}"
+  done
+
   common::export_provided_env_vars "${ENV_VARS[@]}"
   common::parse_and_export_env_vars
   # Support for setting PATH to repo root.
