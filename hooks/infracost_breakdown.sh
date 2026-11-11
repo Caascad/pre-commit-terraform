@@ -2,8 +2,8 @@
 set -eo pipefail
 
 # globals variables
-# shellcheck disable=SC2155 # No way to assign to readonly variable in separate lines
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_DIR
 # shellcheck source=_common.sh
 . "$SCRIPT_DIR/_common.sh"
 
@@ -12,8 +12,11 @@ function main {
   common::parse_cmdline "$@"
   common::export_provided_env_vars "${ENV_VARS[@]}"
   common::parse_and_export_env_vars
+
+  local -r tool_name="infracost"
+
   # shellcheck disable=SC2153 # False positive
-  infracost_breakdown_ "${HOOK_CONFIG[*]}" "${ARGS[*]}"
+  infracost_breakdown_ "$tool_name" "${HOOK_CONFIG[*]}" "${ARGS[*]}"
 }
 
 #######################################################################
@@ -22,6 +25,7 @@ function main {
 # Environment variables:
 #   PRE_COMMIT_COLOR (string) If set to `never` - do not colorize output
 # Arguments:
+#   tool_name (string) name of the wrapped tool, used to resolve its path
 #   hook_config (string with array) arguments that configure hook behavior
 #   args (string with array) arguments that configure wrapped tool behavior
 # Outputs:
@@ -29,9 +33,15 @@ function main {
 #   diff, summary about infracost check (non-supported resources etc.)
 #######################################################################
 function infracost_breakdown_ {
-  local -r hook_config="$1"
+  local -r tool_name="$1"
+  local -r hook_config="$2"
   local args
-  read -r -a args <<< "$2"
+  read -r -a args <<< "$3"
+
+  local -r tool_version=$(common::get_hook_config_value "--tool-version")
+  local tool_path
+  tool_path=$(common::resolve_tool_path "$tool_name" "$tool_version") || exit $?
+  readonly tool_path
 
   # Get hook settings
   IFS=";" read -r -a checks <<< "$hook_config"
@@ -41,7 +51,7 @@ function infracost_breakdown_ {
   fi
 
   local RESULTS
-  RESULTS="$(infracost breakdown "${args[@]}" --format json)"
+  RESULTS="$("$tool_path" breakdown "${args[@]}" --format json)"
   local API_VERSION
   API_VERSION="$(jq -r .version <<< "$RESULTS")"
 
@@ -70,19 +80,24 @@ function infracost_breakdown_ {
     # -h .totalHourlyCost > 0.1
     # --hook-config=.currency == "USD"
     first_char=${check:0:1}
-    last_char=${check: -1}
+    last_char=${check:$((${#check} - 1)):1}
     if [ "$first_char" == "$last_char" ] && {
       [ "$first_char" == '"' ] || [ "$first_char" == "'" ]
     }; then
-      check="${check:1:-1}"
+      check="${check:1:$((${#check} - 2))}"
     fi
 
-    mapfile -t operations < <(echo "$check" | grep -oE '[!<>=]{1,2}')
+    # Replace mapfile with while read loop for bash 3.2 compatibility
+    operations=()
+    while IFS= read -r line; do
+      operations+=("$line")
+    done < <(echo "$check" | grep -oE '[!<>=]{1,2}')
+
     # Get the very last operator, that is used in comparison inside `jq` query.
     # From the example below we need to pick the `>` which is in between `add` and `1000`,
     # but not the `!=`, which goes earlier in the `jq` expression
     # [.projects[].diff.totalMonthlyCost | select (.!=null) | tonumber] | add > 1000
-    operation=${operations[-1]}
+    operation=${operations[$((${#operations[@]} - 1))]}
 
     IFS="$operation" read -r -a jq_check <<< "$check"
     real_value="$(jq "${jq_check[0]}" <<< "$RESULTS")"

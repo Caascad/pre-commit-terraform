@@ -3,8 +3,8 @@
 set -eo pipefail
 
 # globals variables
-# shellcheck disable=SC2155 # No way to assign to readonly variable in separate lines
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_DIR
 # shellcheck source=_common.sh
 . "$SCRIPT_DIR/_common.sh"
 
@@ -19,26 +19,30 @@ function main {
 
   common::export_provided_env_vars "${ENV_VARS[@]}"
   common::parse_and_export_env_vars
-  # Support for setting PATH to repo root.
-  for i in "${!ARGS[@]}"; do
-    ARGS[i]=${ARGS[i]/__GIT_WORKING_DIR__/$(pwd)\/}
-  done
+
   # JFYI: tflint color already suppressed via PRE_COMMIT_COLOR=never
+
+  local -r tool_name="tflint"
+  local -r tool_version=$(common::get_hook_config_value "--tool-version")
+  local tool_path
+  tool_path=$(common::resolve_tool_path "$tool_name" "$tool_version") || exit $?
+  readonly tool_path
 
   # Run `tflint --init` for check that plugins installed.
   # It should run once on whole repo.
   {
-    TFLINT_INIT=$(tflint --init 2>&1) 2> /dev/null &&
+    # shellcheck disable=SC2153 # ARGS is set in common::parse_cmdline
+    TFLINT_INIT=$("$tool_path" --init "${ARGS[@]}" 2>&1) 2> /dev/null &&
       common::colorify "green" "Command 'tflint --init' successfully done:" &&
       echo -e "${TFLINT_INIT}\n\n\n"
   } || {
     local exit_code=$?
     common::colorify "red" "Command 'tflint --init' failed:"
-    echo "${TFLINT_INIT}"
+    echo -e "${TFLINT_INIT}"
     return ${exit_code}
   }
 
-  common::per_dir_hook "$HOOK_ID" "${#ARGS[@]}" "${ARGS[@]}" "${FILES[@]}"
+  common::per_dir_hook "$HOOK_ID" "$tool_path" "${#ARGS[@]}" "${ARGS[@]}" "${FILES[@]}"
 }
 
 #######################################################################
@@ -47,25 +51,38 @@ function main {
 # Arguments:
 #   dir_path (string) PATH to dir relative to git repo root.
 #     Can be used in error logging
+#   change_dir_in_unique_part (string/false) Modifier which creates
+#     possibilities to use non-common chdir strategies.
+#     Availability depends on hook.
+#   parallelism_disabled (bool) if true - skip lock mechanism
 #   args (array) arguments that configure wrapped tool behavior
+#   tool_path (string) resolved path to the wrapped tool's binary
 # Outputs:
 #   If failed - print out hook checks status
 #######################################################################
 function per_dir_hook_unique_part {
   local -r dir_path="$1"
-  shift
+  local -r change_dir_in_unique_part="$2"
+  # shellcheck disable=SC2034 # Unused var.
+  local -r parallelism_disabled="$3"
+  local -r tool_path="$4"
+  shift 4
   local -a -r args=("$@")
 
-  # Print checked PATH **only** if TFLint have any messages
-  # shellcheck disable=SC2091,SC2068 # Suppress error output
-  $(tflint ${args[@]} 2>&1) 2> /dev/null || {
-    common::colorify "yellow" "TFLint in $dir_path/:"
+  if [ "$change_dir_in_unique_part" == "delegate_chdir" ]; then
+    local dir_args="--chdir=$dir_path"
+  fi
 
-    tflint "${args[@]}"
-  }
+  # shellcheck disable=SC2086 # we need to remove the arg if its unset
+  TFLINT_OUTPUT=$("$tool_path" ${dir_args:-} "${args[@]}" 2>&1)
+  local exit_code=$?
+
+  if [ $exit_code -ne 0 ]; then
+    common::colorify "yellow" "TFLint in $dir_path/:"
+    echo -e "$TFLINT_OUTPUT"
+  fi
 
   # return exit code to common::per_dir_hook
-  local exit_code=$?
   return $exit_code
 }
 

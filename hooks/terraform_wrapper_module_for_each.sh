@@ -2,8 +2,8 @@
 set -eo pipefail
 
 # globals variables
-# shellcheck disable=SC2155 # No way to assign to readonly variable in separate lines
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_DIR
 # shellcheck source=_common.sh
 . "$SCRIPT_DIR/_common.sh"
 
@@ -14,10 +14,15 @@ function main {
   common::parse_and_export_env_vars
   # JFYI: suppress color for `hcledit` is N/A`
 
-  check_dependencies
+  local -r tool_name="hcledit"
+
+  local -r tool_version=$(common::get_hook_config_value "--tool-version")
+  local tool_path
+  tool_path=$(common::resolve_tool_path "$tool_name" "$tool_version") || exit $?
+  readonly tool_path
 
   # shellcheck disable=SC2153 # False positive
-  terraform_module_wrapper_ "${ARGS[*]}"
+  terraform_module_wrapper_ "$tool_path" "${ARGS[*]}"
 }
 
 readonly CONTENT_MAIN_TF='module "wrapper" {}'
@@ -113,9 +118,9 @@ module "wrapper" {
 
 ```hcl
 terraform {
-  source = "tfr:///terraform-aws-modules/s3-bucket/aws//wrappers"
+  source = "tfr:///MODULE_REPO_ORG/MODULE_REPO_SHORTNAME/MODULE_REPO_PROVIDER//WRAPPER_PATH"
   # Alternative source:
-  # source = "git::git@github.com:terraform-aws-modules/terraform-aws-s3-bucket.git//wrappers?ref=master"
+  # source = "git::git@github.com:MODULE_REPO_ORG/terraform-MODULE_REPO_PROVIDER-MODULE_REPO_SHORTNAME.git//WRAPPER_PATH?ref=master"
 }
 
 inputs = {
@@ -143,8 +148,9 @@ inputs = {
 ```'
 
 function terraform_module_wrapper_ {
+  local -r tool_path="$1"
   local args
-  read -r -a args <<< "$1"
+  read -r -a args <<< "$2"
 
   local root_dir
   local module_dir="" # values: empty (default), "." (just root module), or a single module (e.g. "modules/iam-user")
@@ -291,8 +297,6 @@ EOF
     # Wrappers will be stored in "wrappers/{module_name}"
     output_dir="${root_dir}/${wrapper_dir}/${module_name}"
 
-    [[ ! -d "$output_dir" ]] && mkdir -p "$output_dir"
-
     # Calculate relative depth for module source by number of slashes
     module_depth="${module_dir//[^\/]/}"
 
@@ -314,43 +318,51 @@ EOF
 
     # Read content of all terraform files
     # shellcheck disable=SC2207
-    all_tf_content=$(find "${full_module_dir}" -name '*.tf' -maxdepth 1 -type f -exec cat {} +)
+    all_tf_content=$(find "${full_module_dir}" -maxdepth 1 \( -name '*.tf' -o -name '*.tofu' \) -type f -exec cat {} +)
 
     if [[ ! $all_tf_content ]]; then
-      common::colorify "yellow" "Skipping ${full_module_dir} because there are no *.tf files."
+      common::colorify "yellow" "Skipping ${full_module_dir} because there are no .tf or .tofu files."
       continue
     fi
 
     # Get names of module variables in all terraform files
     # shellcheck disable=SC2207
-    module_vars=($(echo "$all_tf_content" | hcledit block list | grep variable. | cut -d'.' -f 2))
+    module_vars=($(echo "$all_tf_content" | "$tool_path" block list | { grep "^variable\." | cut -d'.' -f 2 | sort || true; }))
 
     # Get names of module outputs in all terraform files
     # shellcheck disable=SC2207
-    module_outputs=($(echo "$all_tf_content" | hcledit block list | grep output. | cut -d'.' -f 2))
+    module_outputs=($(echo "$all_tf_content" | "$tool_path" block list | { grep "^output\." | cut -d'.' -f 2 || true; }))
+
+    # Get names of module providers in all terraform files
+    module_providers=$(echo "$all_tf_content" | "$tool_path" block list | { grep "^provider\." || true; })
+
+    if [[ $module_providers ]]; then
+      common::colorify "yellow" "Skipping ${full_module_dir} because it is a legacy module which contains its own local provider configurations and so calls to it may not use the for_each argument."
+      break
+    fi
 
     # Looking for sensitive output
-    local wrapper_output_sensitive="# sensitive = false  # No sensitive module output found"
+    local wrapper_output_sensitive="# sensitive = false # No sensitive module output found"
     for module_output in "${module_outputs[@]}"; do
-      module_output_sensitive=$(echo "$all_tf_content" | hcledit attribute get "output.${module_output}.sensitive")
+      module_output_sensitive=$(echo "$all_tf_content" | "$tool_path" attribute get "output.${module_output}.sensitive")
 
       # At least one output is sensitive - the wrapper's output should be sensitive, too
       if [[ "$module_output_sensitive" == "true" ]]; then
-        wrapper_output_sensitive="sensitive   = true  # At least one sensitive module output (${module_output}) found (requires Terraform 0.14+)"
+        wrapper_output_sensitive="sensitive   = true # At least one sensitive module output (${module_output}) found (requires Terraform 0.14+)"
         break
       fi
     done
 
     # Create content of temporary main.tf file
-    hcledit attribute append module.wrapper.source "\"${relative_source_path}${module_dir}\"" --newline -f "$tmp_file_tf" -u
-    hcledit attribute append module.wrapper.for_each var.items --newline -f "$tmp_file_tf" -u
+    "$tool_path" attribute append module.wrapper.source "\"${relative_source_path}${module_dir}\"" --newline -f "$tmp_file_tf" -u
+    "$tool_path" attribute append module.wrapper.for_each var.items --newline -f "$tmp_file_tf" -u
 
     # Add newline before the first variable in a loop
     local newline="--newline"
 
     for module_var in "${module_vars[@]}"; do
       # Get default value for the variable
-      var_default=$(echo "$all_tf_content" | hcledit attribute get "variable.${module_var}.default")
+      var_default=$(echo "$all_tf_content" | "$tool_path" attribute get "variable.${module_var}.default")
 
       # Empty default means that the variable is required
       if [[ ! $var_default ]]; then
@@ -360,11 +372,18 @@ EOF
         # https://github.com/terraform-aws-modules/terraform-aws-security-group/blob/0bd31aa88339194efff470d3b3f58705bd008db0/rules.tf#L8
         # As a result, wrappers in terraform-aws-security-group module are missing values of the rules variable and is not useful. :(
         var_value="try(each.value.${module_var}, var.defaults.${module_var}, {})"
+      elif [[ $var_default == \<\<* ]]; then
+        # Heredoc style default values produce HCL parsing error:
+        # 'Unterminated template string; No closing marker was found for the string.'
+        # Because closing marker must be alone on it's own line:
+        # https://developer.hashicorp.com/terraform/language/expressions/strings#heredoc-strings
+        var_value="try(each.value.${module_var}, var.defaults.${module_var}, $var_default
+          )"
       else
         var_value="try(each.value.${module_var}, var.defaults.${module_var}, $var_default)"
       fi
 
-      hcledit attribute append "module.wrapper.${module_var}" "${var_value}" $newline -f "$tmp_file_tf" -u
+      "$tool_path" attribute append "module.wrapper.${module_var}" "${var_value}" $newline -f "$tmp_file_tf" -u
 
       newline=""
     done
@@ -374,10 +393,24 @@ EOF
     if [[ "$dry_run" == "false" ]]; then
       common::colorify "green" "Saving files into \"${output_dir}\""
 
+      # Create output dir
+      [[ ! -d "$output_dir" ]] && mkdir -p "$output_dir"
+
       mv "$tmp_file_tf" "${output_dir}/main.tf"
 
       echo "$CONTENT_VARIABLES_TF" > "${output_dir}/variables.tf"
-      echo "$CONTENT_VERSIONS_TF" > "${output_dir}/versions.tf"
+
+      # If the root module has a versions.tf, use that; otherwise, create it.
+      if [[ -f "${full_module_dir}/versions.tf" ]]; then
+        cp "${full_module_dir}/versions.tf" "${output_dir}/versions.tf"
+        # Don't propagate redundant `provider_meta` attributes
+        # AWS-provider specific
+        "$tool_path" attribute rm "terraform.provider_meta.${module_repo_provider}.user_agent" -f "${output_dir}/versions.tf" -u
+        # GCP-provider specific
+        "$tool_path" attribute rm "terraform.provider_meta.${module_repo_provider}.module_name" -f "${output_dir}/versions.tf" -u
+      else
+        echo "$CONTENT_VERSIONS_TF" > "${output_dir}/versions.tf"
+      fi
 
       echo "$CONTENT_OUTPUTS_TF" > "${output_dir}/outputs.tf"
       sed -i.bak "s|WRAPPER_OUTPUT_SENSITIVE|${wrapper_output_sensitive}|g" "${output_dir}/outputs.tf"
@@ -398,14 +431,6 @@ EOF
 
   done
 
-}
-
-function check_dependencies {
-  if ! command -v hcledit > /dev/null; then
-    echo "ERROR: The binary 'hcledit' is required by this hook but is not installed or is not in the system's PATH."
-    echo "Check documentation: https://github.com/minamijoyo/hcledit"
-    exit 1
-  fi
 }
 
 function create_tmp_file_tf {
